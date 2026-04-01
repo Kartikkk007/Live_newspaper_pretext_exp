@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react"
 
 const PAPER_NAME = "THE PRETEXT CHRONICLE"
-const LETTER_FONT_SIZE = "clamp(32px, 6vw, 72px)"
-
+const LETTER_FONT_SIZE = "clamp(24px, 5.5vw, 60px)"
 function getLetterfontSizePx() {
   const vw = window.innerWidth
   const clamped = Math.min(Math.max(32, vw * 0.06), 72)
@@ -127,9 +126,10 @@ export default function DraggableMasthead({ onExclusionChange }) {
     >
       <div style={{
         display: "inline-flex",
-        flexWrap: "wrap",
+        flexWrap: "nowrap",
         justifyContent: "center",
         lineHeight: 1,
+        whiteSpace: "nowrap",
       }}>
         {letters.map((letter, i) => {
           const isSpace = letter === " "
