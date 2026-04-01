@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import { prepare, layout } from "@chenglou/pretext"
 import HeadlineStretcher from "./HeadlineStretcher"
 import PullQuoteInjector from "./PullQuoteInjector"
+import { useExclusionLayout } from "../hooks/useExclusionLayout"
 
 function measureLineCount(text, fontSize, colWidth) {
   if (!text || colWidth < 20) return 0
@@ -24,7 +25,6 @@ function distributeTextToColumns(text, fontSize, colWidth, numCols) {
 
   for (let col = 0; col < numCols; col++) {
     if (wordIndex >= words.length) { columns.push({ text: "", lineCount: 0 }); continue }
-
     const isLastCol = col === numCols - 1
     if (isLastCol) {
       const remaining = words.slice(wordIndex).join(" ")
@@ -32,39 +32,39 @@ function distributeTextToColumns(text, fontSize, colWidth, numCols) {
       columns.push({ text: remaining, lineCount: lc })
       break
     }
-
-    let lo = wordIndex
-    let hi = words.length
+    let lo = wordIndex, hi = words.length
     let bestEnd = wordIndex + Math.floor(words.length / numCols)
-
     for (let iter = 0; iter < 18; iter++) {
       const mid = Math.floor((lo + hi) / 2)
       const chunk = words.slice(wordIndex, mid).join(" ")
       const lc = measureLineCount(chunk, fontSize, colWidth)
       if (lc <= targetLinesPerCol) { bestEnd = mid; lo = mid + 1 }
-      else { hi = mid - 1 }
+      else hi = mid - 1
     }
-
     const colText = words.slice(wordIndex, bestEnd).join(" ")
     const lc = measureLineCount(colText, fontSize, colWidth)
     columns.push({ text: colText, lineCount: lc })
     wordIndex = bestEnd
   }
-
   return columns
 }
 
 const COLUMN_GAP = 28
 const NUM_COLS = 2
 
-export default function NewspaperLayout({ article, fontSize, isFirst }) {
+export default function NewspaperLayout({ article, fontSize, isFirst, exclusion }) {
   const containerRef = useRef(null)
   const canvasRefs = [useRef(null), useRef(null)]
+  const colRefs = [useRef(null), useRef(null)]
   const [containerWidth, setContainerWidth] = useState(0)
   const [columns, setColumns] = useState([])
   const [activePullQuote, setActivePullQuote] = useState(null)
   const [computingCol, setComputingCol] = useState(null)
   const [totalMetrics, setTotalMetrics] = useState(null)
+  const [exclusionLines, setExclusionLines] = useState({})
+  const exclusionRafRef = useRef(null)
+
+  const { layoutWithExclusion } = useExclusionLayout()
 
   const colWidth = containerWidth
     ? Math.floor((containerWidth - COLUMN_GAP * (NUM_COLS - 1)) / NUM_COLS)
@@ -85,12 +85,10 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
   useEffect(() => {
     if (!article?.body || !colWidth || colWidth < 20) return
     setComputingCol("all")
-
     const raf = requestAnimationFrame(() => {
       const bodyText = activePullQuote
         ? article.body.replace(activePullQuote, "").replace(/\s+/g, " ").trim()
         : article.body
-
       const distributed = distributeTextToColumns(bodyText, fontSize, colWidth, NUM_COLS)
       setColumns(distributed)
       setTotalMetrics({
@@ -100,49 +98,125 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
       })
       setComputingCol(null)
     })
-
     return () => cancelAnimationFrame(raf)
   }, [article, fontSize, colWidth, activePullQuote])
+
+  useEffect(() => {
+    if (!exclusion || !colWidth || columns.length === 0) {
+      setExclusionLines({})
+      return
+    }
+
+    if (exclusionRafRef.current) cancelAnimationFrame(exclusionRafRef.current)
+
+    exclusionRafRef.current = requestAnimationFrame(() => {
+      const newExclusionLines = {}
+
+      columns.forEach((col, i) => {
+        if (!col.text || !colRefs[i].current) return
+
+        const colRect = colRefs[i].current.getBoundingClientRect()
+        const colPageX = colRect.left
+        const colPageY = colRect.top + window.scrollY
+
+        const result = layoutWithExclusion(
+          col.text,
+          fontSize,
+          colWidth,
+          colPageX,
+          colPageY,
+          exclusion
+        )
+
+        if (result.lines.some((l) => l.isConstrained)) {
+          newExclusionLines[i] = result
+        }
+      })
+
+      setExclusionLines(newExclusionLines)
+    })
+
+    return () => {
+      if (exclusionRafRef.current) cancelAnimationFrame(exclusionRafRef.current)
+    }
+  }, [exclusion, columns, colWidth, fontSize, layoutWithExclusion])
 
   useEffect(() => {
     columns.forEach((col, i) => {
       const canvas = canvasRefs[i].current
       if (!canvas || !col.lineCount) return
-
       const lh = fontSize * 1.55
-      const totalHeight = col.lineCount * lh + 8
+      const exLines = exclusionLines[i]
+      const lineCount = exLines ? exLines.lines.length : col.lineCount
+      const totalHeight = lineCount * lh + 8
       canvas.width = colWidth
       canvas.height = totalHeight
-
       const ctx = canvas.getContext("2d")
       ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-      for (let j = 0; j < col.lineCount; j++) {
-        if (j % 2 === 0) { ctx.fillStyle = "rgba(180,140,80,0.05)"; ctx.fillRect(0, j * lh, colWidth, lh) }
-        const baseY = j * lh + fontSize * 0.82
-        ctx.strokeStyle = "rgba(180,140,80,0.22)"; ctx.lineWidth = 0.5; ctx.setLineDash([2, 4])
-        ctx.beginPath(); ctx.moveTo(0, baseY); ctx.lineTo(colWidth, baseY); ctx.stroke()
-        const xLineY = j * lh + fontSize * 0.18
-        ctx.strokeStyle = "rgba(200,100,60,0.1)"; ctx.lineWidth = 0.5; ctx.setLineDash([1, 6])
-        ctx.beginPath(); ctx.moveTo(0, xLineY); ctx.lineTo(colWidth, xLineY); ctx.stroke()
-      }
-      ctx.setLineDash([])
-    })
-  }, [columns, colWidth, fontSize])
+      const linesToDraw = exLines ? exLines.lines : Array.from({ length: col.lineCount }, (_, j) => ({ lineIndex: j, isConstrained: false, availableWidth: colWidth }))
 
-  const handlePullQuoteSelect = useCallback((sentence) => {
-    setActivePullQuote(sentence)
-  }, [])
+      linesToDraw.forEach((line, j) => {
+        if (j % 2 === 0) { ctx.fillStyle = "rgba(180,140,80,0.05)"; ctx.fillRect(0, j * lh, colWidth, lh) }
+        if (line.isConstrained) {
+          ctx.fillStyle = "rgba(139,58,15,0.07)"
+          ctx.fillRect(0, j * lh, line.availableWidth, lh)
+          ctx.strokeStyle = "rgba(139,58,15,0.4)"; ctx.lineWidth = 1; ctx.setLineDash([3, 3])
+          ctx.beginPath(); ctx.moveTo(line.availableWidth, j * lh); ctx.lineTo(line.availableWidth, j * lh + lh); ctx.stroke()
+          ctx.setLineDash([])
+        }
+        const baseY = j * lh + fontSize * 0.82
+        ctx.strokeStyle = line.isConstrained ? "rgba(139,58,15,0.3)" : "rgba(180,140,80,0.22)"
+        ctx.lineWidth = 0.5; ctx.setLineDash([2, 4])
+        ctx.beginPath(); ctx.moveTo(0, baseY); ctx.lineTo(line.isConstrained ? line.availableWidth : colWidth, baseY); ctx.stroke()
+        ctx.setLineDash([])
+      })
+    })
+  }, [columns, exclusionLines, colWidth, fontSize])
+
+  const handlePullQuoteSelect = useCallback((sentence) => { setActivePullQuote(sentence) }, [])
 
   if (!article) return null
 
   const lh = fontSize * 1.55
 
+  const renderColumnText = (col, i) => {
+    const exResult = exclusionLines[i]
+    if (!exResult || exResult.lines.length === 0) {
+      return (
+        <p style={{ fontSize: `${fontSize}px`, lineHeight: 1.55, color: "#1a1008", margin: 0, wordBreak: "break-word", textAlign: "left" }}>
+          {col.text}
+        </p>
+      )
+    }
+
+    return (
+      <div style={{ position: "relative" }}>
+        {exResult.lines.map((line, j) => (
+          <div
+            key={j}
+            style={{
+              fontSize: `${fontSize}px`,
+              lineHeight: 1.55,
+              color: "#1a1008",
+              maxWidth: `${line.availableWidth}px`,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "clip",
+            }}
+          >
+            {line.text}
+          </div>
+        ))}
+      </div>
+    )
+  }
+
   return (
     <article ref={containerRef} style={{
       fontFamily: "'Times New Roman', serif",
       borderTop: isFirst ? "4px solid #1a1008" : "2px solid #1a1008",
-      paddingTop: "16px", paddingBottom: "24px", marginBottom: "0",
+      paddingTop: "16px", paddingBottom: "24px",
       background: "#f5efe0", position: "relative",
     }}>
       {containerWidth > 0 && (
@@ -153,14 +227,18 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
 
       <div style={{ display: "flex", gap: `${COLUMN_GAP}px`, alignItems: "flex-start", position: "relative" }}>
         {columns.map((col, i) => (
-          <div key={i} style={{ width: `${colWidth}px`, flexShrink: 0, position: "relative" }}>
+          <div key={i} ref={colRefs[i]} style={{ width: `${colWidth}px`, flexShrink: 0, position: "relative" }}>
             <div style={{
               fontFamily: "'Courier New', Courier, monospace", fontSize: "7px",
               letterSpacing: "0.16em", color: "#9a7a5a", textTransform: "uppercase",
               marginBottom: "5px", display: "flex", justifyContent: "space-between",
             }}>
               <span>COL {i + 1}</span>
-              <span>{computingCol === "all" ? "measuring..." : `${col.lineCount} lines · ${colWidth}px`}</span>
+              <span>
+                {computingCol === "all" ? "measuring..." : exclusionLines[i]
+                  ? `${exclusionLines[i].lines.length} lines · EXCLUSION ACTIVE`
+                  : `${col.lineCount} lines · ${colWidth}px`}
+              </span>
             </div>
 
             <div style={{ width: "100%", height: "1px", background: "#1a1008", marginBottom: "8px" }} />
@@ -172,15 +250,13 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
                   <div style={{ fontSize: `${fontSize}px`, lineHeight: 1.55, color: "#c9b89a", animation: "pulse 0.7s ease-in-out infinite alternate" }}>
                     Measuring...
                   </div>
-                ) : i === 0 ? (
+                ) : i === 0 && !exclusionLines[i] ? (
                   <PullQuoteInjector
                     body={col.text} fontSize={fontSize} containerWidth={colWidth}
                     activePullQuote={activePullQuote} onPullQuoteSelect={handlePullQuoteSelect}
                   />
                 ) : (
-                  <p style={{ fontSize: `${fontSize}px`, lineHeight: 1.55, color: "#1a1008", margin: 0, wordBreak: "break-word", textAlign: "left" }}>
-                    {col.text}
-                  </p>
+                  renderColumnText(col, i)
                 )}
               </div>
             </div>
@@ -189,8 +265,7 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
 
         {columns.length === NUM_COLS && (
           <div style={{
-            position: "absolute", left: `${colWidth + COLUMN_GAP / 2}px`, top: 0, bottom: 0,
-            width: "1px",
+            position: "absolute", left: `${colWidth + COLUMN_GAP / 2}px`, top: 0, bottom: 0, width: "1px",
             background: "repeating-linear-gradient(to bottom, #1a1008 0px, #1a1008 4px, transparent 4px, transparent 8px)",
             transform: "translateX(-0.5px)",
           }} />
@@ -208,7 +283,9 @@ export default function NewspaperLayout({ article, fontSize, isFirst }) {
           <span>TOTAL LINES: {totalMetrics.totalLines}</span>
           <span>COL WIDTH: {totalMetrics.colWidth}px</span>
           <span>FONT: {totalMetrics.fontSize}px</span>
-          <span>LINE HEIGHT: {Math.round(totalMetrics.fontSize * 1.55)}px</span>
+          {Object.keys(exclusionLines).length > 0 && (
+            <span style={{ color: "#8B3A0F", fontWeight: "bold" }}>✦ LETTER EXCLUSION ACTIVE</span>
+          )}
           <span style={{ color: "#8B3A0F", fontWeight: "bold" }}>✦ NO DOM READS</span>
         </div>
       )}
